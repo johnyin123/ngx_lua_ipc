@@ -18,6 +18,8 @@ static void receive_alert_delay_log_timer_handler(ngx_event_t *ev);
 static void send_alert_delay_log_timer_handler(ngx_event_t *ev);
 
 
+#define ipc_writepage_space (ngx_pagesize - sizeof(ipc_writepager_t))
+
 static void ipc_read_handler(ngx_event_t *ev);
 
 ngx_int_t ipc_init(ipc_t *ipc) {
@@ -34,6 +36,9 @@ ngx_int_t ipc_init(ipc_t *ipc) {
     proc->pipe[1]=NGX_INVALID_FILE;
     proc->c=NULL;
     proc->active = 0;
+    
+    proc->wp = NULL;
+    
     ngx_memzero(proc->wbuf.alerts, sizeof(proc->wbuf.alerts));
     proc->wbuf.first = 0;
     proc->wbuf.n = 0;
@@ -41,6 +46,45 @@ ngx_int_t ipc_init(ipc_t *ipc) {
     proc->wbuf.overflow_last = NULL;
     proc->wbuf.overflow_n = 0;
   }
+  return NGX_OK;
+}
+
+static ipc_writepager_t *ipc_new_writepage(ipc_process_t *proc, size_t writepage_data_sz) {
+  ipc_writepager_t  *wp;
+  wp = ngx_alloc(sizeof(ipc_writepager_t) + writepage_data_sz, ngx_cycle->log);
+  if(!proc->wp) {
+    proc->wp = wp;
+    proc->wp_last = wp;
+  }
+  else {
+    proc->wp_last->next_page = wp;
+    proc->wp_last = wp;
+  }
+  wp->write_cur = &wp->data;
+  wp->cur = &wp->data;
+  wp->end = &wp->data + writepage_data_sz;
+  return wp;
+}
+
+static ngx_int_t ipc_add_to_writebuf(ipc_process_t *proc, ipc_alert_t *alert) {
+  ipc_writepager_t  *wp;
+  size_t             sz = sizeof(alert);
+  
+  if(sz <= ipc_writepage_space) {
+    wp = proc->wp_last;
+    if(!wp || ((size_t )(wp->end - wp->cur) < sz)) {
+      //no writepage or not enough space in last writepage
+      wp = ipc_new_writepage(proc, ipc_writepage_space);
+    }
+  }
+  else {
+    //large alert
+    wp = ipc_new_writepage(proc, sz);
+  }
+  ngx_memcpy(wp->cur, alert, sz);
+  wp->cur += sz;
+  wp->cur = (char *)ngx_align_ptr(wp->cur, sizeof(void *));
+  
   return NGX_OK;
 }
 
@@ -130,6 +174,7 @@ ngx_int_t ipc_close(ipc_t *ipc, ngx_cycle_t *cycle) {
   int i;
   ipc_process_t            *proc;
   ipc_writebuf_overflow_t  *of, *of_next;
+  ipc_writepager_t         *wp, *wp_next;
   
   for (i=0; i<NGX_MAX_PROCESSES; i++) {
     proc = &ipc->process[i];
@@ -143,6 +188,11 @@ ngx_int_t ipc_close(ipc_t *ipc, ngx_cycle_t *cycle) {
     for(of = proc->wbuf.overflow_first; of != NULL; of = of_next) {
       of_next = of->next;
       ngx_free(of);
+    }
+    
+    for(wp = proc->wp; wp != NULL; wp = wp_next) {
+      wp_next = wp->next_page;
+      ngx_free(wp);
     }
     
     ipc_try_close_fd(&proc->pipe[0]);
@@ -443,8 +493,7 @@ ngx_int_t ipc_alert(ipc_t *ipc, ngx_int_t slot, ngx_uint_t code, void *data, siz
     assert(0);
   }
   ipc_process_t      *proc = &ipc->process[slot];
-  ipc_writebuf_t     *wb = &proc->wbuf;
-  ipc_alert_t        *alert;
+  ipc_alert_t         alert;
   
   if(slot == ngx_process_slot) {
     ipc->handler(slot, code, data);
@@ -455,38 +504,19 @@ ngx_int_t ipc_alert(ipc_t *ipc, ngx_int_t slot, ngx_uint_t code, void *data, siz
     return NGX_ERROR;
   }
   
-  if(wb->n < IPC_WRITEBUF_SIZE) {
-    alert = &wb->alerts[(wb->first + wb->n++) % IPC_WRITEBUF_SIZE];
-  }
-  else { //overflow
-    ipc_writebuf_overflow_t  *overflow;
-    DBG("writebuf overflow, allocating memory");
-    if((overflow = ngx_alloc(sizeof(*overflow), ngx_cycle->log)) == NULL) {
-      ERR("can't allocate memory for IPC write buffer overflow");
-      return NGX_ERROR;
-    }
-    overflow->next = NULL;
-    alert= &overflow->alert;
-    
-    if(wb->overflow_first == NULL) {
-      wb->overflow_first = overflow;
-    }
-    if(wb->overflow_last) {
-      wb->overflow_last->next = overflow;
-    }
-    wb->overflow_last = overflow;
   
-    wb->overflow_n++;
-  }
   
-  alert->src_slot = ngx_process_slot;
-  alert->time_sent = ngx_time();
-  alert->code = code;
+  alert.src_slot = ngx_process_slot;
+  alert.time_sent = ngx_time();
+  alert.code = code;
   //alert->worker_generation = memstore_worker_generation;
-  alert->worker_generation = 0;
+  alert.worker_generation = 0;
   ngx_memcpy(&alert->data, data, data_size);
   
-  ipc_write_handler(proc->c->write);
+  if(ipc_write_alert_fd(proc->c->fd, &a) != NGX_OK) {
+    
+    ipc_write_handler(proc->c->write);
+  }
   
   //ngx_handle_write_event(ipc->c[slot]->write, 0);
   //ngx_add_event(ipc->c[slot]->write, NGX_WRITE_EVENT, NGX_CLEAR_EVENT);

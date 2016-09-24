@@ -17,6 +17,15 @@ struct ipc_writebuf_overflow_s {
   ipc_writebuf_overflow_t  *next;
 };
 
+
+typedef struct {
+  char            data[IPC_DATA_SIZE];
+  time_t          time_sent;
+  int16_t         src_slot;
+  uint16_t        worker_generation;
+  uint8_t         code;
+} ipc_new_alert_t;
+
 typedef struct ipc_writebuf_s ipc_writebuf_t;
 struct ipc_writebuf_s {
   //a ring buffer with a linked-list overflow for writing alerts, 
@@ -30,11 +39,25 @@ struct ipc_writebuf_s {
 
 typedef struct ipc_s ipc_t;
 
+
+
+typedef struct ipc_writepager_s ipc_writepager_t;
+struct ipc_writepager_s {
+  ipc_writepager_t *next_page;
+  char *write_cur;
+  char *cur;
+  char *end;
+  char  data;
+};
+
+
 typedef struct {
   ipc_t                 *ipc; //useful for write events
   ngx_socket_t           pipe[2];
   ngx_connection_t      *c;
   ipc_writebuf_t         wbuf;
+  ipc_writepager_t      *wp;
+  ipc_writepager_t      *wp_last;
   unsigned               active:1;
 } ipc_process_t;
 
